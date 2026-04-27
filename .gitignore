@@ -1,4 +1,4 @@
-config.local.py
+config_local.py
 __pycache__/
 *.pyc
 cache/

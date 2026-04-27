@@ -3,8 +3,9 @@ from __future__ import annotations
 import base64
 import io
 import math
+import shutil
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -41,8 +42,12 @@ ASPECT_BASE_LEVEL = 2
 CACHE_BASE = Path.home() / "attendance" / "cache"
 CACHE_GSI = CACHE_BASE / "gsi_std"
 CACHE_NOWC = CACHE_BASE / "jma_nowc_hrpns"
+CACHE_NOWC_RETENTION = timedelta(hours=3)
+CACHE_CLEANUP_INTERVAL = timedelta(minutes=30)
 CACHE_GSI.mkdir(parents=True, exist_ok=True)
 CACHE_NOWC.mkdir(parents=True, exist_ok=True)
+
+_LAST_NOWCAST_CACHE_CLEANUP: datetime | None = None
 
 
 def _global_pixel(lat: float, lon: float, z: int) -> tuple[float, float]:
@@ -82,6 +87,61 @@ def _fetch_cached(root: Path, z: int, x: int, y: int, url: str, *, allow_missing
         raise
 
 
+def _parse_nowcast_cache_time(name: str) -> datetime | None:
+    try:
+        return datetime.strptime(name, "%Y%m%d%H%M%S").replace(tzinfo=UTC)
+    except ValueError:
+        return None
+
+
+def cleanup_nowcast_cache(
+    retention: timedelta = CACHE_NOWC_RETENTION,
+    *,
+    now: datetime | None = None,
+    force: bool = False,
+) -> int:
+    global _LAST_NOWCAST_CACHE_CLEANUP
+
+    current = now or datetime.now(UTC)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=UTC)
+    else:
+        current = current.astimezone(UTC)
+
+    if (
+        not force
+        and _LAST_NOWCAST_CACHE_CLEANUP is not None
+        and current - _LAST_NOWCAST_CACHE_CLEANUP < CACHE_CLEANUP_INTERVAL
+    ):
+        return 0
+
+    _LAST_NOWCAST_CACHE_CLEANUP = current
+    cutoff = current - retention
+    removed = 0
+
+    for path in CACHE_NOWC.iterdir():
+        if not path.is_dir():
+            continue
+
+        cached_at = _parse_nowcast_cache_time(path.name)
+        if cached_at is None:
+            try:
+                cached_at = datetime.fromtimestamp(path.stat().st_mtime, UTC)
+            except OSError:
+                continue
+
+        if cached_at >= cutoff:
+            continue
+
+        try:
+            shutil.rmtree(path)
+            removed += 1
+        except OSError:
+            pass
+
+    return removed
+
+
 @dataclass(frozen=True)
 class NowcastFrame:
     basetime: str
@@ -95,6 +155,7 @@ class NowcastFrame:
 def get_latest_n1_frame(timeout: int = 10) -> NowcastFrame:
     n1 = requests.get(NOWC_TARGET_N1_URL, timeout=timeout).json()
     latest = n1[0]
+    cleanup_nowcast_cache()
     return NowcastFrame(basetime=latest["basetime"], validtime=latest["validtime"])
 
 
